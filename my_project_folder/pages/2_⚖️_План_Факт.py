@@ -5,23 +5,37 @@ from oauth2client.service_account import ServiceAccountCredentials
 import plotly.express as px
 
 st.set_page_config(page_title="План-Факт Расходов", layout="wide")
-SHEET_URL = "https://docs.google.com/spreadsheets/d/1IvNrboP0eML1Mc3lk2WJ2Oze0kA5RT8pakzgjETh_eM/edit?gid=1885685439#gid=1885685439"
 
-# --- ЗАГРУЗКА ---
+# ==========================================
+# 🔒 ПРОВЕРКА ДОСТУПА
+# ==========================================
+if not st.session_state.get("authenticated", False):
+    st.warning("⚠️ Пожалуйста, сначала войдите в систему на Главной странице.")
+    st.stop()
+
+# Получаем данные пользователя из сессии
+current_user = st.session_state["username"]
+user_role = st.session_state["role"]       # 'admin' или 'manager'
+real_name = st.session_state["real_name"]  # 'Отабек', 'Лана' и т.д.
+
+# ==========================================
+# 📥 ЗАГРУЗКА
+# ==========================================
+SHEET_URL = "https://docs.google.com/spreadsheets/d/1IvNrboP0eML1Mc3lk2WJ2Oze0kA5RT8pakzgjETh_eM/edit?gid=0#gid=0"
+
 @st.cache_data(ttl=600)
 def load_data():
     scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-    creds_dict = dict(st.secrets["gcp_service_account"])
-    creds_dict["type"] = "service_account"
-    if "private_key" in creds_dict:
-        creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
-    
-    creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
-    client = gspread.authorize(creds)
-    
     try:
+        creds_dict = dict(st.secrets["gcp_service_account"])
+        creds_dict["type"] = "service_account"
+        if "private_key" in creds_dict:
+            creds_dict["private_key"] = creds_dict["private_key"].replace("\\n", "\n")
+        
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(creds_dict, scope)
+        client = gspread.authorize(creds)
+        
         sh = client.open_by_url(SHEET_URL)
-        # Загружаем вкладки по названиям из ваших скринов
         ws_plan = sh.worksheet("Согласованные расходы") 
         ws_fact = sh.worksheet("Фактические расходы")
         
@@ -30,7 +44,7 @@ def load_data():
         
         return df_plan, df_fact
     except Exception as e:
-        st.error(f"Ошибка: {e}")
+        st.error(f"Ошибка загрузки: {e}")
         return pd.DataFrame(), pd.DataFrame()
 
 def clean_money(x):
@@ -41,92 +55,120 @@ def clean_money(x):
         except: return 0.0
     return x
 
-# --- ОБРАБОТКА ---
-st.title("⚖️ Анализ: План vs Факт")
+def find_money_column(df, possible_names):
+    df.columns = [c.strip() for c in df.columns]
+    for col in df.columns:
+        for name in possible_names:
+            if name.lower() in col.lower():
+                return col
+    return None
+
+# ==========================================
+# ⚙️ ОБРАБОТКА ДАННЫХ
+# ==========================================
+st.title(f"⚖️ План-Факт: {real_name}")
 
 df_plan_raw, df_fact_raw = load_data()
 
 if df_plan_raw.empty or df_fact_raw.empty:
-    st.warning("Нет данных. Проверьте названия вкладок 'Согласованные расходы' и 'Фактические расходы'.")
+    st.warning("Данные не загружены.")
     st.stop()
 
-# 1. Подготовка ПЛАНА
-# На вашем скрине колонка с деньгами называется "Сумма, в дс"
+# Обработка Плана
 df_plan = df_plan_raw.copy()
-df_plan["Сумма_План"] = df_plan["Сумма, в дс"].apply(clean_money)
-# Группируем, чтобы убрать дубли, если есть
+plan_col = find_money_column(df_plan, ["Сумма", "в дс", "sum"])
+if plan_col:
+    df_plan["Сумма_План"] = df_plan[plan_col].apply(clean_money)
+else:
+    st.error("Не найдена колонка с суммой в Плане")
+    st.stop()
+
+# Группировка Плана
 df_plan_g = df_plan.groupby(["Менеджер", "Проект", "Статья расходов"])["Сумма_План"].sum().reset_index()
 
-# 2. Подготовка ФАКТА
-# На вашем скрине колонка называется "Сумма, в долл." (отличается от плана!)
+# Обработка Факта
 df_fact = df_fact_raw.copy()
-# Убираем пустые строки, если менеджер не заполнен (вижу пустые на скрине)
-df_fact = df_fact[df_fact["Менеджер"] != ""] 
-df_fact["Сумма_Факт"] = df_fact["Сумма, в долл."].apply(clean_money)
+df_fact = df_fact[df_fact["Менеджер"] != ""]
+fact_col = find_money_column(df_fact, ["Сумма", "в долл", "sum"])
+if fact_col:
+    df_fact["Сумма_Факт"] = df_fact[fact_col].apply(clean_money)
+else:
+    st.error("Не найдена колонка с суммой в Факте")
+    st.stop()
+
+# Группировка Факта
 df_fact_g = df_fact.groupby(["Менеджер", "Проект", "Статья расходов"])["Сумма_Факт"].sum().reset_index()
 
-# 3. ОБЪЕДИНЕНИЕ (Слияние)
-# Соединяем две таблицы по трем ключевым колонкам
+# Слияние
 df_merged = pd.merge(
     df_plan_g, 
     df_fact_g, 
     on=["Менеджер", "Проект", "Статья расходов"], 
-    how="outer" # outer = берем всё, даже если есть только в плане или только в факте
+    how="outer"
 ).fillna(0)
-
-# 4. Расчет отклонений
 df_merged["Отклонение"] = df_merged["Сумма_План"] - df_merged["Сумма_Факт"]
-# Если План 100, Факт 120 -> Отклонение -20 (Перерасход, плохо)
-# Если План 100, Факт 80 -> Отклонение +20 (Экономия, хорошо)
 
-# --- ВИЗУАЛИЗАЦИЯ ---
-
-# Фильтры слева
+# ==========================================
+# 🛡️ ФИЛЬТРАЦИЯ ПО ПРАВАМ ДОСТУПА
+# ==========================================
 st.sidebar.header("Фильтры")
-all_managers = df_merged["Менеджер"].unique()
-sel_manager = st.sidebar.multiselect("Менеджер", all_managers, default=all_managers)
 
-all_projects = df_merged[df_merged["Менеджер"].isin(sel_manager)]["Проект"].unique()
-sel_project = st.sidebar.multiselect("Проект", all_projects, default=all_projects)
+df_final = pd.DataFrame()
 
-# Применяем фильтр
-mask = (df_merged["Менеджер"].isin(sel_manager)) & (df_merged["Проект"].isin(sel_project))
-df_final = df_merged[mask]
+if user_role == "admin":
+    # --- ЛОГИКА АДМИНА ---
+    st.sidebar.success("Режим: Директор (Видит всех)")
+    
+    # Может выбрать кого угодно
+    all_managers = sorted(df_merged["Менеджер"].unique())
+    selected_managers = st.sidebar.multiselect("Выберите менеджера", all_managers, default=all_managers)
+    
+    df_final = df_merged[df_merged["Менеджер"].isin(selected_managers)]
+
+else:
+    # --- ЛОГИКА МЕНЕДЖЕРА ---
+    st.sidebar.info(f"Режим: Менеджер ({real_name})")
+    
+    # Жесткий фильтр: только своё имя
+    df_final = df_merged[df_merged["Менеджер"] == real_name]
+    
+    if df_final.empty:
+        st.info("По вашим проектам данных пока нет.")
+        st.stop()
+
+# ==========================================
+# 📊 ВИЗУАЛИЗАЦИЯ
+# ==========================================
+
+# Фильтр проектов (внутри уже разрешенного списка)
+available_projects = sorted(df_final["Проект"].unique())
+sel_project = st.sidebar.multiselect("Проект", available_projects, default=available_projects)
+
+df_show = df_final[df_final["Проект"].isin(sel_project)]
 
 # Метрики
-total_plan = df_final["Сумма_План"].sum()
-total_fact = df_final["Сумма_Факт"].sum()
-diff = total_plan - total_fact
+tp = df_show["Сумма_План"].sum()
+tf = df_show["Сумма_Факт"].sum()
+diff = tp - tf
 
-m1, m2, m3 = st.columns(3)
-m1.metric("Всего Согласовано (План)", f"${total_plan:,.0f}".replace(",", " "))
-m2.metric("Всего Потрачено (Факт)", f"${total_fact:,.0f}".replace(",", " "))
-m3.metric("Разница (Экономия)", f"${diff:,.0f}".replace(",", " "), 
-          delta_color="normal") # Зеленый если +, Красный если -
+c1, c2, c3 = st.columns(3)
+c1.metric("План", f"${tp:,.0f}".replace(",", " "))
+c2.metric("Факт", f"${tf:,.0f}".replace(",", " "))
+c3.metric("Экономия", f"${diff:,.0f}".replace(",", " "), delta_color="normal")
 
 st.divider()
 
-# Таблица с подсветкой
-st.subheader("Детальная таблица")
-
+# Таблица
+st.subheader("Детализация")
 def highlight_diff(val):
-    if val < -1: return 'color: #FF4B4B; font-weight: bold' # Красный (Перерасход)
-    elif val > 1: return 'color: #09AB3B; font-weight: bold' # Зеленый (Экономия)
+    if val < -10: return 'color: #FF4B4B' # Перерасход
+    elif val > 10: return 'color: #09AB3B' # Экономия
     return ''
 
 st.dataframe(
-    df_final.style
+    df_show.style
     .format("{:,.0f}", subset=["Сумма_План", "Сумма_Факт", "Отклонение"])
     .map(highlight_diff, subset=["Отклонение"]),
     use_container_width=True,
     height=600
 )
-
-# График
-st.subheader("План vs Факт по Проектам")
-df_chart = df_final.groupby("Проект")[["Сумма_План", "Сумма_Факт"]].sum().reset_index()
-df_melt = df_chart.melt(id_vars="Проект", var_name="Тип", value_name="Сумма")
-
-fig = px.bar(df_melt, x="Проект", y="Сумма", color="Тип", barmode="group",
-             color_discrete_map={"Сумма_План": "#A7C7E7", "Сумма_Факт": "#FF6961"})
-st.plotly_chart(fig, use_container_width=True)
